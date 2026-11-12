@@ -1,4 +1,4 @@
-"""PJSIP endpoint lifecycle: transports from sip.bind, null audio device, G.711-only codecs, one Account per line."""
+"""PJSIP endpoint lifecycle: transports, null audio device, configured codecs, one Account per line."""
 from __future__ import annotations
 
 import asyncio
@@ -9,10 +9,10 @@ import re
 import weakref
 from dataclasses import dataclass, field
 
-from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, USER_RE, Config, LineConfig, host_of
+from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, Config, LineConfig, host_of, tls_proxy_hostname
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.call import AiCall, LineAccount
-from ai_phone.telephony.media_port import RingMediaPort
+from ai_phone.telephony.media_port import ReceiveMediaPort, RingMediaPort
 from ai_phone.telephony.pj import pj
 from ai_phone.telephony.policy import PeerSet, build_peer_set
 from ai_phone.telephony.rings import FrameRing
@@ -44,6 +44,8 @@ class LineSpec:
     trusted_peers: list[str] = field(default_factory=list)
     caller_id: str | None = None
     verified_caller_ids: list[str] = field(default_factory=list)
+    from_user: str = "number"
+    tls_hostname_policy: str = "strict"
 
     @property
     def registrar_host(self) -> str | None:
@@ -63,13 +65,19 @@ class LineSpec:
                    register_via_proxy=c.register_via_proxy, transport=c.transport, register_expiry_sec=c.register_expiry_sec,
                    srtp=c.srtp, accept_invites_from=c.accept_invites_from, trusted_cidrs=list(c.trusted_cidrs),
                    trusted_peers=list(c.trusted_peers), caller_id=c.caller_id,
-                   verified_caller_ids=[v.number for v in c.verified_caller_ids])
+                   verified_caller_ids=[v.number for v in c.verified_caller_ids], from_user=c.from_user,
+                   tls_hostname_policy=c.tls_hostname_policy)
 
 
 def _grammar(c: LineConfig) -> None:
-    checks = [(DISPLAY_RE, c.display_name, "display_name")]
+    tls_proxy_hostname(c)
+    if c.from_user not in ("number", "account"):
+        raise ValueError("line from_user must be number or account")
+    if c.kind != "trunk" and c.from_user != "number":
+        raise ValueError("line from_user: account is only valid on a trunk line")
+    checks = [(DISPLAY_RE, c.display_name, "display_name"), (SIP_USER_RE, c.user, "user")]
     if c.kind == "trunk":
-        checks += [(USER_RE, c.user, "user"), (SIP_URI_RE, c.registrar or "", "registrar")]
+        checks.append((SIP_URI_RE, c.registrar or "", "registrar"))
         if c.number is not None:
             checks.append((E164_RE, c.number, "number"))
         if c.caller_id is not None:
@@ -77,7 +85,7 @@ def _grammar(c: LineConfig) -> None:
         if c.outbound_proxy is not None:
             checks.append((SIP_URI_RE, c.outbound_proxy, "outbound_proxy"))
     else:
-        checks += [(SIP_USER_RE, c.user, "user"), (AOR_RE, c.aor or "", "aor")]
+        checks.append((AOR_RE, c.aor or "", "aor"))
         if c.caller_id is not None:
             checks.append((AOR_RE, c.caller_id, "caller_id"))
     for rx, value, name in checks:
@@ -92,9 +100,10 @@ def id_uri(spec: LineSpec) -> str:
 
 
 def local_uri(spec: LineSpec) -> str:
-    """Per-call From. Trunks present the E.164 caller id at the registrar; sip lines use their caller_id URI verbatim."""
+    """Per-call From: the trunk's selected identity, or a sip line's caller_id URI verbatim."""
     if spec.kind == "trunk":
-        return f'"{spec.display_name}" <sip:{spec.caller_id or spec.number}@{spec.registrar_host}>'
+        user = spec.user if spec.from_user == "account" else spec.caller_id or spec.number
+        return f'"{spec.display_name}" <sip:{user}@{spec.registrar_host}>'
     return spec.caller_id or spec.aor
 
 
@@ -196,7 +205,7 @@ def request_uri(spec: LineSpec, target: str) -> str:
 
 
 def check_caller_id(spec: LineSpec) -> None:
-    if spec.kind != "trunk":
+    if spec.kind != "trunk" or spec.from_user == "account":
         return
     cid = spec.caller_id or spec.number
     if cid is None:
@@ -219,8 +228,11 @@ class Telephony:
         self.echo_mode = echo_mode
         self.ep: pj.Endpoint | None = None
         self.port: RingMediaPort | None = None
+        self.receive_port: ReceiveMediaPort | RingMediaPort | None = None
         self.accounts: dict[str, LineAccount] = {}
         self.transport_ids: dict[str, int] = {}
+        self.line_transport_ids: dict[str, int] = {}
+        self._uses_verified_tls = False
         self.current_call: AiCall | None = None
         self.peer_warnings: list[str] = []
         self._call_lock = threading.Lock()  # make_call (asyncio thread) and onIncomingCall (PJSIP thread) both claim current_call
@@ -256,11 +268,40 @@ class Telephony:
 
     # ---- start --------------------------------------------------------------------------------
     def start(self) -> None:
+        if self.echo_mode and self.cfg.playback_rate != 16000:
+            raise ValueError("the diagnostic echo mode requires 16 kHz playback; remove opus from codecs")
+        if "opus" in self.cfg.codecs:
+            version = getattr(pj, "ai_phone_opus_version", None)
+            if (not callable(version) or version() != 1
+                    or not callable(getattr(pj, "ai_phone_enable_opus", None))):
+                raise RuntimeError("Opus requires a rebuilt native binding; run ./scripts/install.sh from the ai-phone checkout")
+        verified_hosts = {}
+        for line in self.lines:
+            hostname = tls_proxy_hostname(line, f"line {line.id}")
+            if hostname is not None:
+                verified_hosts[line.id] = hostname
+        if verified_hosts:
+            version = getattr(pj, "ai_phone_tls_verifier_version", None)
+            if (not callable(version) or version() != 1
+                    or not callable(getattr(pj, "ai_phone_create_verified_tls_transport", None))
+                    or not callable(getattr(pj, "ai_phone_reset_tls_verifier", None))
+                    or not callable(getattr(pj, "ai_phone_deactivate_tls_verifier", None))):
+                raise RuntimeError("verified TLS hostname policy requires a rebuilt native binding; "
+                                   "run ./scripts/install.sh from the ai-phone checkout")
         ep = AiEndpoint(self)
         ep.libCreate()
+        self.ep = ep  # partial transport/account failures must also destroy the native endpoint
+        self._stopping = False
+        try:
+            self._start_endpoint(ep, verified_hosts)
+        except BaseException:
+            self.stop()
+            raise
+
+    def _start_endpoint(self, ep: AiEndpoint, verified_hosts: dict[str, str]) -> None:
         ec = pj.EpConfig()
         ec.uaConfig.threadCnt = 1
-        ec.medConfig.clockRate = ec.medConfig.sndClockRate = 16000
+        ec.medConfig.clockRate = ec.medConfig.sndClockRate = self.cfg.playback_rate
         ec.medConfig.audioFramePtime = 20
         ec.medConfig.ecTailLen = 0
         ec.medConfig.noVad = True
@@ -271,31 +312,64 @@ class Telephony:
         for ns in (s.nameservers or _system_resolvers()):
             ec.uaConfig.nameserver.append(ns)
         ep.libInit(ec)
+        if "opus" in self.cfg.codecs:
+            status = pj.ai_phone_enable_opus()
+            if status != 0:
+                raise RuntimeError(f"could not initialize Opus (PJSIP status {status})")
         ep.audDevManager().setNullDev()
         pj.ai_phone_set_keepalive(s.tcp_keepalive_sec, s.tcp_keepalive_sec)
         self.transport_ids["udp"] = ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, self._tc(s.bind.udp_port))
         self.transport_ids["tcp"] = ep.transportCreate(pj.PJSIP_TRANSPORT_TCP, self._tc(s.bind.tcp_port))
-        if any(l.transport == "tls" for l in self.lines):
-            tc = self._tc(s.bind.tls_port)
-            import certifi
-            tc.tlsConfig.CaListFile = s.tls.ca_file or certifi.where()
+        if any(l.transport == "tls" and l.id not in verified_hosts for l in self.lines):
+            tc = self._tls_config(s.bind.tls_port)
             tc.tlsConfig.verifyServer = True
-            if s.tls.cert_file:
-                tc.tlsConfig.certFile = s.tls.cert_file
-                tc.tlsConfig.privKeyFile = s.tls.key_file
             self.transport_ids["tls"] = ep.transportCreate(pj.PJSIP_TRANSPORT_TLS, tc)
+        for line_id, hostname in verified_hosts.items():
+            # Each account selects its own factory. The native handshake callback
+            # authenticates this fixed proxy before PJSIP can send queued SIP bytes.
+            self._uses_verified_tls = True
+            transport_id = pj.ai_phone_create_verified_tls_transport(self._tls_config(0), hostname)
+            if transport_id < 0:
+                raise RuntimeError(f"line {line_id}: could not create verified TLS transport "
+                                   f"(PJSIP status {-transport_id}); no fallback was used")
+            self.line_transport_ids[line_id] = transport_id
         ep.libStart()
-        wanted = tuple(f"{c}/8000" for c in self.cfg.codecs)
-        for ci in ep.codecEnum2():
-            ep.codecSetPriority(ci.codecId, 255 if ci.codecId.startswith(wanted) else 0)
-        self.port = RingMediaPort(self.rx, self.tx, echo=self.echo_mode)
-        self.ep = ep
+        self._configure_codecs(ep)
+        if self.cfg.playback_rate == 16000:
+            self.port = RingMediaPort(self.rx, self.tx, echo=self.echo_mode)
+            self.receive_port = self.port
+        else:
+            self.port = RingMediaPort(None, self.tx, sample_rate=self.cfg.playback_rate)
+            self.receive_port = ReceiveMediaPort(self.rx)
         for spec in self.lines:
             peers = self._peers_for(spec)
             acc = LineAccount(self, spec, peers)
             acc.create(self._account_config(spec))
             self.accounts[spec.id] = acc
             log.info("line %s: %s %s transport=%s policy=%s", spec.id, spec.kind, spec.number or spec.aor, spec.transport, spec.accept_invites_from)
+
+    def _configure_codecs(self, ep) -> None:
+        prefixes = {"PCMU": "PCMU/8000/", "PCMA": "PCMA/8000/", "G722": "G722/16000/", "opus": "opus/48000/"}
+        available = ep.codecEnum2()
+        codecs = [str(c.codecId) for c in available]
+        priorities = {}
+        for index, name in enumerate(self.cfg.codecs):
+            matches = [codec for codec in codecs if codec.startswith(prefixes[name])]
+            if not matches:
+                raise RuntimeError(f"configured codec {name} is unavailable; rebuild with ./scripts/install.sh")
+            priorities.update({codec: 254 - index for codec in matches})
+        for codec in codecs:
+            ep.codecSetPriority(codec, priorities.get(codec, 0))
+
+    def _tls_config(self, port: int) -> "pj.TransportConfig":
+        import certifi
+        tc = self._tc(port)
+        tc.tlsConfig.CaListFile = self.cfg.sip.tls.ca_file or certifi.where()
+        tc.tlsConfig.verifyServer = True
+        if self.cfg.sip.tls.cert_file:
+            tc.tlsConfig.certFile = self.cfg.sip.tls.cert_file
+            tc.tlsConfig.privKeyFile = self.cfg.sip.tls.key_file
+        return tc
 
     def _tc(self, port: int) -> "pj.TransportConfig":
         tc = pj.TransportConfig()
@@ -319,7 +393,8 @@ class Telephony:
     def _account_config(self, spec: LineSpec) -> "pj.AccountConfig":
         ac = pj.AccountConfig()
         ac.idUri = id_uri(spec)
-        ac.sipConfig.transportId = self.transport_ids[spec.transport]
+        ac.sipConfig.transportId = (self.line_transport_ids[spec.id] if spec.id in self.line_transport_ids
+                                    else self.transport_ids[spec.transport])
         if spec.kind == "trunk":
             ac.regConfig.registrarUri = spec.registrar
             ac.regConfig.timeoutSec = spec.register_expiry_sec
@@ -433,6 +508,8 @@ class Telephony:
             Telephony._drop_answer_timeout(call)
 
     def stop(self) -> None:
+        if self._uses_verified_tls:
+            pj.ai_phone_deactivate_tls_verifier()
         with self._call_lock:
             self._stopping = True  # no new claim from either thread from here on
             call = self.current_call
@@ -457,6 +534,18 @@ class Telephony:
                 except Exception:
                     pass
             self.accounts = {}
+            if self.port is not None or self.receive_port is not None:
+                # Stop and join the null-device media clock while its Python callback target
+                # and rings are still owned. If this fails, retain them and the endpoint.
+                self.ep.audDevManager().setNoDev()
+            self.receive_port = None
             self.port = None
             self.ep.libDestroy()
             self.ep = None
+            # Slots can be released only after all factories and child sockets are gone.
+            if self._uses_verified_tls:
+                if not pj.ai_phone_reset_tls_verifier():
+                    raise RuntimeError("verified TLS state could not be released after endpoint destruction")
+                self._uses_verified_tls = False
+            self.transport_ids.clear()
+            self.line_transport_ids.clear()

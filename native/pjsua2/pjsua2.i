@@ -10,6 +10,8 @@
 //
 %{
 #include "pjsua2.hpp"
+#include "tls_verify.hpp"
+#include "opus_support.hpp"
 using namespace std;
 using namespace pj;
 %}
@@ -329,3 +331,9 @@ def ai_phone_get_keepalive():
 %}
 
 %include "pjsua2/endpoint.hpp"
+
+/* ai-phone: isolated TLS verification plus deactivate-before-destroy/reset lifecycle. */
+%include "tls_verify.hpp"
+
+/* ai-phone: optional fullband codec registration and defaults before accounts. */
+%include "opus_support.hpp"

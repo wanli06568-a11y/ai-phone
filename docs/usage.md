@@ -9,14 +9,27 @@ Setup, carrier commands, brain configuration and the full agent command contract
 ```bash
 git clone https://github.com/oxnw/ai-phone.git && cd ai-phone
 ./scripts/install.sh        # the SIP library and the Python environment (needs Homebrew and uv)
-uv run ai-phone setup       # choose call directions, a brain, a line and a voice; downloads and checks models
-uv run ai-phone run         # start ai-phone
+ai-phone setup              # choose call directions, a brain, a line and a voice; downloads and checks models
+ai-phone run                # start ai-phone
 ```
 
 `setup` saves everything under `~/.ai-phone/` (`config.yaml`, and keys and passwords in `secrets.env`, both
-readable only by you) and changes only what you pick when you run it again. `uv run ai-phone setup --plain` asks the
-same questions as plain prompts. The models go to the Hugging Face cache; `uv run ai-phone models pull` fetches them
-without the wizard. The commands below are written as `ai-phone …`; from the repo folder that is `uv run ai-phone …`.
+readable only by you) and changes only what you pick when you run it again. `ai-phone setup --plain` asks the
+same questions as plain prompts. The models go to the Hugging Face cache; `ai-phone models pull` fetches them
+without the wizard. The installer puts an `ai-phone` launcher in `~/.local/bin`, so every command works
+from any folder. If that directory is missing from PATH, the installer prints the command to add it;
+put that same PATH setting in your shell profile for new terminals. Keep the checkout and its `.venv`
+in place: the launcher uses them directly. After moving the checkout, rebuild its environment with
+`./scripts/install.sh`, then explicitly replace the old launcher from the new checkout with
+`.venv/bin/python scripts/install_cli.py --replace`.
+
+For an existing installation, add just the launcher from the repo folder without rebuilding dependencies:
+
+```bash
+.venv/bin/python scripts/install_cli.py
+```
+
+`uv run ai-phone …` still works from the repository for development.
 
 Setup first asks whether to **receive and place calls**, **place calls only**, or **receive calls only**.
 Receiving calls needs `ai-phone run` to stay running while you want to be reachable. For outgoing calls only,
@@ -28,19 +41,38 @@ and choosing **Change call directions**, then restart a running daemon to apply 
 
 To change the number people see when your agent calls, run setup again and choose **Change caller ID**.
 Pick a line, then its purchased number or one of your verified numbers. You can also verify another number you
-own through Twilio or Telnyx. Switching back to the line's number keeps your verified numbers for later;
+own through Twilio, Telnyx or an API-managed SignalWire line. Switching back to the line's number keeps your verified numbers for later;
 restart a running daemon to apply the selection.
 
 The Voice step offers Phonon 31M English (streaming, one bundled voice at normal speed) and Kokoro
 (American and British voices, adjustable speed). Both run directly through MLX in the daemon's TTS worker.
 Existing configurations keep Kokoro. To select Phonon by hand, set
-`tts: {engine: phonon, voice: default, speed: 1.0}`, run `uv run ai-phone models pull`, then restart the daemon.
+`tts: {engine: phonon, voice: default, speed: 1.0}`, run `ai-phone models pull`, then restart the daemon.
 Only the selected speech model is required; voices and weights are loaded from disk before calls begin.
 
 No carrier yet? Enable receiving calls, pick "A SIP address" in setup and keep the default name `agent`. Talk to it locally with
 `pjsua --local-port 5070 sip:agent@127.0.0.1` (free). Substitute your SIP name if you changed it.
 
 The carrier and SIP commands are below.
+
+## Audio codecs
+
+Calls default to G.711 (`PCMU`, `PCMA`) for telephone compatibility. To offer higher-quality audio, rebuild
+with `./scripts/install.sh` from the checkout, then add this top-level setting to `~/.ai-phone/config.yaml`:
+
+```yaml
+codecs: [opus, G722, PCMU, PCMA]
+```
+
+The order sets preference. Opus enables 48 kHz playback; G.722 provides wideband fallback, followed by ordinary
+G.711. Speech recognition stays at 16 kHz. The codec must also be supported by the peer, and a carrier can
+convert audio further along the route. Negotiating Opus with a carrier does not prove fullband audio reaches
+the handset. Existing Phonon and Kokoro voices generate 24 kHz audio; higher-rate playback preserves their
+available detail but adds none above their native bandwidth. This setting does not add a Fish backend.
+
+After any active call ends, run `ai-phone stop`, then `ai-phone run` to load the saved configuration. The daemon
+logs the negotiated codec when media connects. An older binding or unavailable selected codec produces rebuild
+guidance; it is not silently ignored. To return to the default, use `codecs: [PCMU, PCMA]` and restart again.
 
 ## Numbers, forwarding and SIP
 
@@ -83,9 +115,41 @@ ai-phone status
 
 During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying or connecting a number talks to the carrier once, from the `lines` command or `setup`, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what ai-phone created at the carrier (a number you brought is disconnected and stays on your account) and lists exactly what is left for you to remove in the portal if a deletion fails — or, if the journal recording what was created has gone missing, refuses rather than delete the local record of a number that is still billing. Configuration applies at restart. The NAT and transport checks run before calling it done are in [nat-checklist.md](nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
 
+Telnyx and Twilio recovery stops if a resource search is incomplete or multiple resources match. If the error
+reports duplicates, review the matching resources in the carrier portal before retrying `ai-phone lines resume`
+for the same line. Telnyx also pauses before changing number routing when the connection's credentials or settings
+differ from the saved setup; review the reported fields in the portal before resuming. Recovery does not overwrite
+existing SIP credentials to make them match.
+
+Some Telnyx accounts mask existing SIP passwords in API responses, which prevents ai-phone from verifying them.
+If setup reports this, complete the connection's number routing in the Telnyx portal, then run `ai-phone setup`
+and choose **My own SIP trunk** with the connection's known SIP username and password.
+
 What an incoming call hears is set by one `inbound:` section of the config: a greeting that plays on every incoming
 call, and the instructions ai-phone's own model follows when no AI is waiting in `ai-phone listen` (the example config
 takes a message).
+
+## SignalWire and trunk identity
+
+SignalWire is available in setup and through `ai-phone lines add signalwire --existing …`. It uses a Space host,
+Project ID and API token to connect a number already on the account. New numbers must currently be bought in
+SignalWire's portal. See [SignalWire setup](signalwire.md) for credentials, commands, caller ID and verification status.
+
+Manual trunks can set `from_user: account` (CLI: `--from-user account`) when the provider requires the authenticated
+SIP username in outbound From. The default `number` keeps the existing Telnyx/Twilio behavior. Account mode may be
+used without a local phone number; the provider controls the displayed caller ID. Registration and digest
+credentials are unchanged, and inbound source checks remain in force.
+
+The `user` field accepts 1–64 ASCII letters, digits, dots, underscores and hyphens, such as `usuario_12345`.
+Use the SIP username supplied by your provider; it is preserved in registration and authentication, and in
+outbound From when `from_user: account`. The separate `number` and `caller_id` fields still require E.164
+phone numbers when present. Generated carrier usernames keep their existing alphanumeric format.
+
+TLS lines default to `tls_hostname_policy: strict`. New SignalWire TLS setups explicitly select
+`verified_wildcard`, which verifies the certificate chain, dates and DNS SAN during the handshake on a dedicated
+transport. It requires a fixed TLS outbound proxy and `register_via_proxy: true`. Existing lines retain their
+policy on resume. See [TLS certificates](signalwire.md#tls-certificates) for the binding rebuild, manual upgrade
+and incoming-connection limitation.
 
 ## Brains and privacy
 
@@ -128,6 +192,10 @@ Tell your agent it has the `ai-phone` command. It has two ways to make a call.
 ai-phone call +15555550100 --json \
   --prompt "Ask whether they have a table for two at 8 tonight, under the name Sam."
 ```
+
+Use `--prompt` to give the agent a specific task. If it is omitted, empty or only whitespace, the model is
+instructed to have a brief natural conversation, answer the recipient and acknowledge that no task was supplied
+if asked. It is instructed not to invent a business purpose, a message from its owner or a test scenario.
 
 A phone agent `call` blocks until the call ends, which can take up to `conversation.max_call_sec` (600 seconds). With
 `--json` it also writes each progress event to stderr as one JSON line, starting with

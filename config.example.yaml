@@ -24,6 +24,11 @@ lines:
     accept_invites_from: registered_trunk       # registered_trunk | trusted | lan | any
     trusted_cidrs: []                           # the carrier's signalling ranges; written by the provider
     caller_id: "+442079460000"
+    from_user: number                         # number (default) | account; account uses the SIP username in From
+                                              # SignalWire uses account and its endpoint send_as for the displayed number
+    tls_hostname_policy: strict             # strict (default) | verified_wildcard
+                                            # verified_wildcard requires a TLS trunk, register_via_proxy: true and
+                                            # outbound_proxy: "sip:DNS-host[:port];transport=tls". See docs/signalwire.md.
   agents:                                 # a SIP address with no carrier (agents calling agents)
     kind: sip
     user: agents
@@ -45,6 +50,12 @@ calls:
   relay_filler_after_ms: 1500  # relay mode: say "One moment." after this long without a reply from your AI
   relay_second_filler_sec: 10  # and "Still with you, one moment." at this many seconds
   relay_reply_timeout_sec: 25  # then apologise and hang up
+
+# Ordered preferences. Defaults preserve ordinary narrowband telephone compatibility.
+# To offer fullband playback with fallback: [opus, G722, PCMU, PCMA].
+# Re-run ./scripts/install.sh for Opus support, then restart the daemon after saving.
+# Higher call quality depends on the carrier route and receiving device.
+codecs: [PCMU, PCMA]
 
 rtp:
   port_min: 10000

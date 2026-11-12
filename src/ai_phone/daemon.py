@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import platform
 import signal
-import socket
 import sys
 import time
 from pathlib import Path
@@ -25,7 +23,7 @@ from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
 from ai_phone.secrets import load_secrets, redact
 from ai_phone.services.client import WorkerClient, is_secret_env
-from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, untag_frame
+from ai_phone.services.ipc import STT_IN_FRAME, tts_out_frame_bytes, untag_frame
 from ai_phone.services.tts import tts_factory
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import BusyError, DialError, LineSpec, Telephony
@@ -165,9 +163,8 @@ class Daemon:
 
     # ---- system prompt and cached phrases -------------------------------------------------------
     def fixed_prompt(self) -> str:
-        """The cached part of every call's instructions. The host line is for a local brain only."""
-        host = None if self.remote_brain else f"You are running on {socket.gethostname()} ({platform.machine()})."
-        return prompts.fixed_instructions(host)
+        """The cached phone instructions, without identifying the computer to callers."""
+        return prompts.fixed_instructions()
 
     async def _cache_phrase(self, tts: WorkerClient, ring: FrameRing, text: str) -> list[bytes]:
         gen = tts.next_gen()
@@ -233,8 +230,10 @@ class Daemon:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         events: asyncio.Queue = asyncio.Queue()
-        rx, tx = FrameRing(None, 100), FrameRing(None, 400)
-        stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
+        playback_rate = self.cfg.playback_rate
+        rx, tx = FrameRing(None, 100), FrameRing(None, 400, frame_bytes=playback_rate // 50 * 2)
+        stt_in = FrameRing(None, 400, frame_bytes=STT_IN_FRAME)
+        tts_out = FrameRing(None, 400, frame_bytes=tts_out_frame_bytes(playback_rate))
         F = FACTORIES["fake" if self.fake else "real"]
         default_prompt = self.fixed_prompt()
         wa = {} if self.fake else {"wire_memory": self.cfg.models.wire_memory}  # the MLX backends pin their weights
@@ -246,8 +245,11 @@ class Daemon:
         spec = llm_worker(self.cfg, self.tier, self.fake, default_prompt, self.secrets, wa)
         llm = WorkerClient("llm", spec["factory"], loop, None, None, spec["warm_args"],
                            factory_args=spec["factory_args"], keep_warm_sec=spec["keep_warm_sec"])
+        tts_args = {"output_rate": playback_rate}
+        if not self.fake:
+            tts_args.update(voice=self.cfg.tts.voice, speed=self.cfg.tts.speed)
         tts = WorkerClient("tts", F["tts"] if self.fake else tts_factory(self.cfg.tts.engine), loop, None, tts_out, dict(wa),
-                           factory_args=None if self.fake else {"voice": self.cfg.tts.voice, "speed": self.cfg.tts.speed}, keep_warm_sec=kw)
+                           factory_args=tts_args, keep_warm_sec=kw)
         tel: Telephony | None = None
         control: ControlServer | None = None
         started: list[WorkerClient] = []
@@ -681,7 +683,7 @@ class Daemon:
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
 
-        # an outbound call without --prompt falls back to prompts.DEFAULT_CALL_SECTION (calling on the owner's behalf);
+        # an outbound call without a task uses prompts.DEFAULT_CALL_SECTION (an honest no-purpose conversation);
         # an incoming call never does: blank inbound instructions mean the take-a-message default
         section = rec.prompt if out else (self.cfg.inbound.instructions.strip() or InboundConfig().instructions)
         system = prompts.system_prompt(ctx["fixed"], section)
@@ -692,7 +694,7 @@ class Daemon:
                             Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greeting"],
                             system, on_turn,
                             prompt_frames=cached["prompt"], warning_frames=cached["warning"],
-                            rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"],
+                            rtp_last_rx_ns=lambda: tel.receive_port.last_rx_ns, apology_frames=cached["apology"],
                             goodbye_frames=cached["goodbye"], opening_frames=ctx["disclosure"] if out else None,
                             direction=rec.direction,
                             replies=RelayReplies(rec.heard) if rec.mode == "relay" else ModelReplies(),

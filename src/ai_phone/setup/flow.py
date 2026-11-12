@@ -12,8 +12,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import ai_phone
 from ai_phone import models, paths, voices
+from ai_phone.carriers import CARRIERS as CARRIER_INFO, managed_caller_id
 from ai_phone.config import E164_RE, HOST_RE, LINE_ID_RE, SIP_USER_RE
 from ai_phone.pipeline.prompts import DISCLOSURE
 from ai_phone.services.backends.cli_brain import CLAUDE_MODELS
@@ -36,7 +36,7 @@ class Plan:
 PLANS = {"claude": Plan("Claude", "Claude Code", "My Claude subscription", "uses the Claude Code login · no API key"),
          "chatgpt": Plan("ChatGPT", "Codex", "My ChatGPT subscription", "uses the Codex login · no API key")}
 SAMPLE = "Hi, this is your agent. This is how I sound on the phone."
-CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
+CARRIERS = tuple((key, value.label) for key, value in CARRIER_INFO.items() if key != "fake")
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
 SPEECH_ENGINES = ("phonon", "kokoro")
 FORWARD_WHEN = ("no-answer", "busy", "unreachable", "all")
@@ -45,8 +45,8 @@ CALLER_ID_WAIT_SEC = 120   # how long to wait while the carrier's call asks for 
 CALLER_ID_POLL_SEC = 3
 TRANSPORTS = ("udp", "tcp", "tls")
 DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it left off next time."
-HALF_DONE = ("That carrier step may be half done. See your lines with: uv run ai-phone lines list\n"
-             "then finish one with: uv run ai-phone lines resume <line>, or undo it with: uv run ai-phone lines remove <line>")
+HALF_DONE = ("That carrier step may be half done. See your lines with: ai-phone lines list\n"
+             "then finish one with: ai-phone lines resume <line>, or undo it with: ai-phone lines remove <line>")
 
 
 @dataclass
@@ -464,7 +464,7 @@ def brain_endpoint(ui, actions, session: Session, cur) -> None:
 def line(ui, actions, session: Session) -> None:
     cur = actions.current()
     i = ui.choose(Page(LINE, "Which connection should ai-phone use?", "You can add more lines later by running setup again."),
-                  [Option("A phone number", "Twilio or Telnyx · a new number, or one already on that account"),
+                  [Option("A phone number", "Twilio, Telnyx or SignalWire"),
                    Option("A SIP address", "free · softphones and other agents"),
                    Option("My own SIP trunk", "your PBX or provider"),
                    Option("Skip", "keep the lines you have" if cur.lines else "add one later")])
@@ -479,7 +479,13 @@ def line(ui, actions, session: Session) -> None:
 def phone_number(ui, actions, session: Session) -> None:
     carrier, name = CARRIERS[ui.choose(
         Page(LINE, "Which carrier?", "ai-phone uses your own account. Numbers and calls are billed by the carrier."),
-        [Option("Twilio", "Account SID + Auth Token"), Option("Telnyx", "API key")])]
+        [Option(label, " + ".join(f.label for f in CARRIER_INFO[key].credentials)) for key, label in CARRIERS])]
+    if carrier == "signalwire" and ui.choose(
+        Page(LINE, "How should SignalWire connect?", "Connect a number already in your SignalWire Space, or enter existing SIP credentials."),
+        [Option("Connect with API", "Space + Project ID + API token"),
+         Option("Use SIP credentials", "configure a SIP endpoint in the SignalWire dashboard")]) == 1:
+        own_trunk(ui, actions, session, preset="signalwire")
+        return
     creds = actions.saved_keys(carrier)
     page = Page(LINE, f"Use the saved {name} key?", f"It is in {home_dir()}/secrets.env.")
     if creds and ui.choose(page, [Option("Use the saved key"), Option("Enter a different key", "replaces the saved key")]) == 1:
@@ -496,24 +502,51 @@ def phone_number(ui, actions, session: Session) -> None:
             owned = busy(ui, session, page, f"Checking your {name} account…", lambda: actions.owned_numbers(carrier, creds))
         except ActionError as e:
             creds, error = None, str(e)
-    # a number that is already a line is not offered (connecting it again would overwrite its routing), nor one an
-    # earlier attempt left half set up (that belongs to `lines resume` / `lines remove`)
-    connected = {ln.get("number") for ln in actions.current().lines.values()} | actions.unfinished_numbers()
-    free = [n for n in owned if n.e164 not in connected]
+    # Existing lines stay hidden. SignalWire can finish a matching pending attachment using its original journal;
+    # purchases, other carriers and ambiguous/failed cleanup journals still belong to lines resume/remove.
+    unfinished = actions.unfinished_numbers()
+    resumable = actions.resumable_numbers(carrier) if carrier == "signalwire" else {}
+    connected = {ln.get("number") for ln in actions.current().lines.values()}
+    free = [n for n in owned if n.e164 not in connected and (n.e164 not in unfinished or n.e164 in resumable)]
     left = f"{len(free)} not yet connected" if free else "none left to connect" if owned else "none on this account"
-    new = ui.choose(Page(LINE, f"A new number, or one already on your {name} account?",
-                         checks=[Check(f"{name} key", f"works · {plural(len(owned), 'number')} on this account", True)]),
-                    [Option("A new number", "search and buy one"), Option(f"One already on my {name} account", left)]) == 0
-    if not new and not free:
-        ui.choose(Page(LINE, f"No other numbers on this {name} account" if owned else f"No numbers on this {name} account",
-                       "A number on your phone's SIM cannot be connected; buy one here, or add a number in the "
-                       f"{name} console and run setup again."),
-                  [Option("Buy a new number")])
-        new = True
+    if not CARRIER_INFO[carrier].purchase:
+        new = False
+        if not free:
+            if any(n.e164 in unfinished for n in owned):
+                page = Page(LINE, "An earlier setup needs attention",
+                            "Finish or undo the unfinished setup before connecting this number. Use the original carrier "
+                            "account. A failed cleanup must be completed before retrying.",
+                            body="See the line and its state: ai-phone lines list\n"
+                                 "To resume a SignalWire line:\n"
+                                 "ai-phone lines resume <line> --key-env SIGNALWIRE_PROJECT_ID "
+                                 "--secret-env SIGNALWIRE_API_TOKEN\n"
+                                 "To undo a SignalWire setup:\n"
+                                 "ai-phone lines remove <line> --key-env SIGNALWIRE_PROJECT_ID "
+                                 "--secret-env SIGNALWIRE_API_TOKEN\n"
+                                 "The saved SIGNALWIRE_SPACE is used; other carriers need their own credentials.")
+            elif owned:
+                page = Page(LINE, f"No unconnected numbers on this {name} account",
+                            "These numbers are already configured. Check them with: ai-phone lines list")
+            else:
+                page = Page(LINE, f"No unconnected numbers on this {name} account",
+                            f"Buy a voice-capable number in your {name} Space, then run setup again to connect it. "
+                            "Number purchases and pricing are managed in the SignalWire dashboard.")
+            ui.choose(page, [Option("Continue")])
+            return
+    else:
+        new = ui.choose(Page(LINE, f"A new number, or one already on your {name} account?",
+                             checks=[Check(f"{name} key", f"works · {plural(len(owned), 'number')} on this account", True)]),
+                        [Option("A new number", "search and buy one"), Option(f"One already on my {name} account", left)]) == 0
+        if not new and not free:
+            ui.choose(Page(LINE, f"No other numbers on this {name} account" if owned else f"No numbers on this {name} account",
+                           "A number on your phone's SIM cannot be connected; buy one here, or add a number in the "
+                           f"{name} console and run setup again."),
+                      [Option("Buy a new number")])
+            new = True
     if new:
         result, n = buy_number(ui, actions, session, carrier, name, creds)
     else:
-        result, n = attach_number(ui, actions, session, carrier, name, creds, free)
+        result, n = attach_number(ui, actions, session, carrier, name, creds, free, resumable=resumable)
     if result.line_id:  # written, or at least journaled: a stop from here on must name it
         session.note(line_note(result, n.e164, name, bought=new))
     if result.code != 0:
@@ -529,16 +562,14 @@ def phone_number(ui, actions, session: Session) -> None:
 def line_note(result: LineResult, number: str, carrier: str, bought: bool) -> str:
     line_id = result.line_id
     if result.code != 0:
-        return (f"line {line_id} ({number}, not finished: uv run ai-phone lines resume {line_id}, "
-                f"or uv run ai-phone lines remove {line_id})")
+        return (f"line {line_id} ({number}, not finished: ai-phone lines resume {line_id}, "
+                f"or ai-phone lines remove {line_id})")
     return f"line {line_id} ({number}, a {carrier} number billed monthly)" if bought else f"line {line_id} ({number})"
 
 
 def credential_fields(carrier: str) -> list[Field]:
-    if carrier == "twilio":
-        return [Field("Account SID", secret=True, placeholder="AC…", validate=required),
-                Field("Auth Token", secret=True, placeholder="32 characters", validate=required)]
-    return [Field("API key", secret=True, placeholder="KEY…", validate=required)]
+    return [Field(field.label, secret=field.secret, placeholder=field.placeholder, validate=required)
+            for field in CARRIER_INFO[carrier].credentials]
 
 
 def buy_number(ui, actions, session: Session, carrier: str, name: str, creds: dict):
@@ -566,16 +597,25 @@ def buy_number(ui, actions, session: Session, carrier: str, name: str, creds: di
                            lambda: actions.buy_number(carrier, creds, n)), n
 
 
-def attach_number(ui, actions, session: Session, carrier: str, name: str, creds: dict, owned: list):
+def attach_number(ui, actions, session: Session, carrier: str, name: str, creds: dict, owned: list,
+                  *, resumable: dict[str, str] | None = None):
+    resumable = resumable or {}
     shown = owned[:20]
-    n = shown[ui.choose(Page(LINE, "Which number?", f"The numbers on your {name} account."), [Option(n.e164) for n in shown])]
+    options = [Option(f"Resume {n.e164}", f"unfinished line {resumable[n.e164]}") if n.e164 in resumable
+               else Option(n.e164) for n in shown]
+    n = shown[ui.choose(Page(LINE, "Which number?", f"The numbers on your {name} account."), options)]
+    resume = n.e164 in resumable
+    verb = "Resume" if resume else "Connect"
     routing = ("Its incoming calls will ring ai-phone." if actions.current().allow_inbound else
                "Its incoming calls will be routed to ai-phone and rejected while receiving is disabled.")
-    if ui.choose(Page(LINE, f"Connect {n.e164} to ai-phone?", f"{routing} Nothing is bought. "
+    detail = (f"Continue setting up line {resumable[n.e164]} with its saved SIP credentials. " if resume else "")
+    question = f"Resume setup for {n.e164}?" if resume else f"Connect {n.e164} to ai-phone?"
+    if ui.choose(Page(LINE, question, detail + f"{routing} Nothing is bought. "
                       "Removing the line later disconnects it and keeps the number."),
-                 [Option(f"Connect {n.e164}", "free")], default=1) != 0:  # Enter means Back
+                 [Option(f"{verb} {n.e164}", "free")], default=1) != 0:  # Enter means Back
         raise Back()
-    return run_line_action(ui, session, Page(LINE, f"Setting up {n.e164}"), f"Connecting {n.e164}…",
+    return run_line_action(ui, session, Page(LINE, f"Setting up {n.e164}"),
+                           f"Resuming {n.e164}…" if resume else f"Connecting {n.e164}…",
                            lambda: actions.attach_number(carrier, creds, n)), n
 
 
@@ -645,22 +685,30 @@ def verify_caller_id(ui, actions, session: Session, carrier: str, name: str, cre
     (mine,) = ask(ui, Page(stage, "Your mobile number", "In international format, like +447700900123."),
                   [Field("Mobile number", mobile, validate=e164)])
     step = busy(ui, session, Page(stage, f"Verifying {mine}"), f"Asking {name} to verify {mine}…",
-                lambda: actions.start_caller_id(carrier, creds, mine))
+                lambda: actions.start_caller_id(carrier, creds, mine, line_id=line_id)
+                if CARRIER_INFO[carrier].managed_caller_id else actions.start_caller_id(carrier, creds, mine))
     verified = (typed_code(ui, actions, session, carrier, creds, step, name, stage) if step.kind == "enter_code_in_cli"
                 else keyed_code(ui, actions, session, carrier, creds, step, name, stage))
     if verified:
         try:
-            actions.record_caller_id(line_id, mine, carrier)
+            if CARRIER_INFO[carrier].managed_caller_id:
+                busy(ui, session, Page(stage, "Updating the caller ID"), f"Setting {name} caller ID to {mine}…",
+                     lambda: actions.record_caller_id(line_id, mine, carrier, creds), kind="carrier")
+            else:
+                actions.record_caller_id(line_id, mine, carrier)
             session.note(f"line {line_id} calls out as {mine}")
         except ActionError as e:  # the carrier has accepted it by now: never lose that quietly
-            ui.choose(Page(stage, f"{mine} is verified, but not saved",
-                           f"{mine} is verified with {name}; run: uv run ai-phone lines verify-caller-id "
-                           f"{line_id} {mine} --key-env <NAME> to record it.", error=str(e)),
+            recovery = (f"Finish the caller-ID change with: ai-phone lines resume {line_id} "
+                        "--key-env SIGNALWIRE_PROJECT_ID --secret-env SIGNALWIRE_API_TOKEN --space <space-host>"
+                        if CARRIER_INFO[carrier].managed_caller_id else
+                        f"{mine} is verified with {name}; run: ai-phone lines verify-caller-id "
+                        f"{line_id} {mine} --key-env <NAME> to record it.")
+            ui.choose(Page(stage, f"{mine} is verified, but not saved", recovery, error=str(e)),
                       [Option("Continue")], back=False)
     else:
         ui.choose(Page(stage, "Verification did not complete",
                        f"Your agent still calls out as {current}. To try again: "
-                       f"uv run ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),
+                       f"ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),
                   [Option("Continue")], back=False)
 
 
@@ -718,20 +766,42 @@ def sip_address(ui, actions, session: Session) -> None:
             error = str(e)
 
 
-def own_trunk(ui, actions, session: Session) -> None:
+def own_trunk(ui, actions, session: Session, *, preset: str | None = None) -> None:
+    from_user = "account" if preset == "signalwire" else ("number", "account")[ui.choose(Page(LINE, "What should outgoing SIP From use?",
+        "Use the identity your PBX or provider requires. With a SIP username, the provider controls the displayed caller ID."),
+        [Option("Phone number", "the line's number or a verified caller ID"),
+         Option("SIP username", "the same account username used to register")])]
     registrar = user = number = error = ""
     while True:
-        registrar, user, password, number = ask(ui, Page(LINE, "Your SIP trunk", "The details your PBX or provider gave you. "
-                                                         f"The password is saved to {home_dir()}/secrets.env.", error=error),
+        detail = ("Use the SIP domain and endpoint credentials from your SignalWire dashboard, not your API token. "
+                  "Set the endpoint caller ID (send_as) in that dashboard." if preset else
+                  "The details your PBX or provider gave you.")
+        registrar, user, password, number = ask(ui, Page(LINE, "Your SignalWire SIP trunk" if preset else "Your SIP trunk",
+                                                         detail + f" The password is saved to {home_dir()}/secrets.env.", error=error),
                                                 [Field("Registrar", registrar, placeholder="sip:sip.example.com", validate=required),
                                                  Field("Username", user, validate=required),
                                                  Field("Password", secret=True, validate=required),
-                                                 Field("Your number on it", number, placeholder="+15550100000", validate=e164)])
-        transport = TRANSPORTS[ui.choose(Page(LINE, "Which transport?", "Use what your provider says; UDP is the usual one."),
-                                         [Option("UDP"), Option("TCP"), Option("TLS", "encrypted signalling")])]
+                                                 Field("Your number on it" + (" (optional)" if from_user == "account" else ""),
+                                                       number, placeholder="+15550100000",
+                                                       validate=(lambda value: e164(value) if value else None)
+                                                       if from_user == "account" else e164)])
+        transport = TRANSPORTS[ui.choose(Page(LINE, "Which transport?",
+                    "Match the SignalWire endpoint settings; TLS uses encrypted signalling." if preset else
+                    "Use what your provider says; UDP is the usual one."),
+                    [Option("UDP"), Option("TCP"), Option("TLS", "encrypted signalling")], default=2 if preset else 0)]
+        srtp = "off"
+        if preset and transport == "tls":
+            srtp = ("required", "optional", "off")[ui.choose(Page(LINE, "Media encryption",
+                    "Match the endpoint encryption setting in SignalWire."),
+                    [Option("Required", "SRTP"), Option("Optional", "accept SRTP or plain audio"), Option("Off")])]
         uri = registrar if registrar.startswith(("sip:", "sips:")) else f"sip:{registrar}"
         try:
-            session.note(f"line {actions.add_trunk_line(uri, user, password, number, transport)} ({number})")
+            if preset:
+                line_id = actions.add_trunk_line(uri, user, password, number, transport, from_user=from_user,
+                                                preset=preset, srtp=srtp)
+            else:
+                line_id = actions.add_trunk_line(uri, user, password, number, transport, from_user=from_user)
+            session.note(f"line {line_id}" + (f" ({number})" if number else ""))
             return
         except ActionError as e:
             error = str(e)
@@ -846,7 +916,7 @@ def change_caller_id(ui, actions, session: Session) -> None:
                   [Option("Continue")])
         return
     lines = [(line_id, ln) for line_id, ln in cur.lines.items()
-             if ln.get("kind", "trunk") == "trunk" and ln.get("number")
+             if ln.get("kind", "trunk") == "trunk" and (ln.get("number") or ln.get("from_user") == "account")
              and (ln.get("provider") is None or provider_of(ln).get("state", "pending") == "ready")]
     if not lines:
         ui.choose(Page(CALLERS, "No phone-number lines are ready",
@@ -855,9 +925,15 @@ def change_caller_id(ui, actions, session: Session) -> None:
         return
     line_id, ln = lines[ui.choose(Page(CALLERS, "Which line's caller ID?",
                                       "Choose the line whose outgoing number you want to change."),
-                                 [Option(f"{line_id} · {ln['number']}",
+                                 [Option(f"{line_id} · {ln.get('number') or ln.get('user', 'SIP account')}",
+                                         "caller ID set by your provider" if ln.get("from_user") == "account" and not managed_caller_id(ln) else
                                          f"currently shows {ln.get('caller_id') or ln['number']}")
                                   for line_id, ln in lines])]
+    if ln.get("from_user") == "account" and not managed_caller_id(ln):
+        ui.choose(Page(CALLERS, "Your provider controls this caller ID",
+                       "This line sends its SIP account username in From. Set the displayed phone number with your provider; "
+                       "changing or verifying a number here would not change outgoing calls."), [Option("Continue")])
+        return
     number, current = ln["number"], ln.get("caller_id") or ln["number"]
     carrier = provider_of(ln).get("name", "")
     name = dict(CARRIERS).get(carrier)
@@ -877,32 +953,41 @@ def change_caller_id(ui, actions, session: Session) -> None:
         selected = ui.choose(Page(CALLERS, "Which number should people see?", detail, error=error), options, default=default)
         error = ""
         try:
+            creds = None
+            if selected >= len(numbers) or managed_caller_id(ln):
+                creds = caller_id_credentials(ui, actions, session, carrier, name, number)
             if selected < len(numbers):
-                actions.use_caller_id(line_id, numbers[selected])
+                if managed_caller_id(ln):
+                    busy(ui, session, Page(CALLERS, "Updating the caller ID"), f"Setting {name} caller ID…",
+                         lambda: actions.use_caller_id(line_id, numbers[selected], creds), kind="carrier")
+                else:
+                    actions.use_caller_id(line_id, numbers[selected])
                 session.note(f"line {line_id} calls out as {numbers[selected]}")
             else:
-                creds = actions.saved_keys(carrier)
-                if creds and ui.choose(Page(CALLERS, f"Use the saved {name} key?",
-                                            "Use the account this line belongs to."),
-                                       [Option("Use the saved key"), Option("Enter a different key")]) == 1:
-                    creds = None
-                if not creds:
-                    typed = [v.strip() for v in ask(ui, Page(CALLERS, f"Your {name} credentials",
-                                                           "Use the account this line belongs to. These credentials "
-                                                           "are used only for this verification."), credential_fields(carrier))]
-                    creds = dict(zip(CARRIER_KEYS[carrier], typed, strict=True))
-                owned = busy(ui, session, Page(CALLERS, f"Checking your {name} account"),
-                             f"Checking your {name} account…",
-                             lambda: actions.owned_numbers(carrier, creds))
-                if not any(n.e164 == number for n in owned):
-                    raise ActionError(f"Could not find {number} on this {name} account. "
-                                      "Enter credentials for the account this line belongs to.")
                 verify_caller_id(ui, actions, session, carrier, name, creds, line_id, current, stage=CALLERS)
             return
         except Back:
             continue
         except ActionError as e:
             error = str(e)
+
+
+def caller_id_credentials(ui, actions, session: Session, carrier: str, name: str, number: str) -> dict:
+    creds = actions.saved_keys(carrier)
+    if creds and ui.choose(Page(CALLERS, f"Use the saved {name} key?", "Use the account this line belongs to."),
+                           [Option("Use the saved key"), Option("Enter a different key")]) == 1:
+        creds = None
+    if not creds:
+        typed = [v.strip() for v in ask(ui, Page(CALLERS, f"Your {name} credentials",
+                                               "Use the account this line belongs to. These credentials are used only "
+                                               "for this caller-ID change."), credential_fields(carrier))]
+        creds = dict(zip(CARRIER_KEYS[carrier], typed, strict=True))
+    owned = busy(ui, session, Page(CALLERS, f"Checking your {name} account"), f"Checking your {name} account…",
+                 lambda: actions.owned_numbers(carrier, creds))
+    if not any(n.e164 == number for n in owned):
+        raise ActionError(f"Could not find {number} on this {name} account. "
+                          "Enter credentials for the account this line belongs to.")
+    return creds
 
 
 def callers(ui, actions, session: Session) -> None:
@@ -983,9 +1068,9 @@ def check_models(ui, actions, session: Session, page: Page) -> Check:
     size = busy(ui, session, page, "Checking the download size…", actions.download_size)
     later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)}, saved in the Hugging Face cache. "
                            "ai-phone needs them to handle calls."),
-                      [Option("Download now", gb(size)), Option("Later", "run: uv run ai-phone models pull")]) == 1
+                      [Option("Download now", gb(size)), Option("Later", "run: ai-phone models pull")]) == 1
     if later:
-        return Check("Models", "not downloaded yet · uv run ai-phone models pull", None)
+        return Check("Models", "not downloaded yet · ai-phone models pull", None)
     try:
         progress(ui, session, Page(CHECK, "Downloading the models", "You can leave this running. It picks up where it "
                                    "stopped if interrupted."), "Downloading…", actions.pull_models)
@@ -1016,10 +1101,10 @@ def done(ui, actions, session: Session) -> None:
 
 
 WIDTH = 88  # the Done page shows this many columns without scrolling
-AI_COMMANDS = (('uv run ai-phone call +15550100000 --prompt "…" --json', "ai-phone's agent talks"),
-               ("uv run ai-phone call +15550100000 --relay --json", "your AI talks (say, listen)"),
-               ("uv run ai-phone listen --json", "wait for a call"),
-               ("uv run ai-phone hangup", "end the call"))
+AI_COMMANDS = (('ai-phone call +15550100000 --prompt "…" --json', "ai-phone's agent talks"),
+               ("ai-phone call +15550100000 --relay --json", "your AI talks (say, listen)"),
+               ("ai-phone listen --json", "wait for a call"),
+               ("ai-phone hangup", "end the call"))
 
 
 def saved_files() -> str:
@@ -1031,7 +1116,7 @@ def saved_files() -> str:
 def done_text(actions, session: Session) -> str:
     cur = actions.current()
     out = [f"Saved in {home_dir()}/   {saved_files()}", ""]
-    rows = [(line_id, ln.get("number") or ln.get("aor") or "",
+    rows = [(line_id, line_address(ln),
              line_kind(ln) + (calls_out(ln) if cur.allow_outbound else "")) for line_id, ln in cur.lines.items()]
     if rows:
         a, b = (max(len(r[i]) for r in rows) for i in (0, 1))
@@ -1051,7 +1136,7 @@ def done_text(actions, session: Session) -> str:
     lifecycle = ("Leave ai-phone running while you want to receive calls." if cur.allow_inbound else
                  "Start ai-phone when you want to place a call; stop it with Ctrl-C afterward.")
     out += [f"Calls    {mode}", f"Brain    {brain_row}", f"Voice    {voice_row}",
-            "", "Start ai-phone", "  uv run ai-phone run", f"  {lifecycle}",
+            "", "Start ai-phone", "  ai-phone run", f"  {lifecycle}",
             "  If already running, stop and restart to apply these settings."]
     if cur.allow_inbound:
         out += ["", "Try it", *try_it(cur.lines)]
@@ -1059,10 +1144,10 @@ def done_text(actions, session: Session) -> str:
     if cur.allow_inbound:
         commands.append(AI_COMMANDS[2])
     elif cur.allow_outbound:
-        commands.append(("uv run ai-phone listen --call <id> --json", "listen to your relay call"))
+        commands.append(("ai-phone listen --call <id> --json", "listen to your relay call"))
     commands.append(AI_COMMANDS[3])
     width = max(len(command) for command, _ in commands)
-    out += ["", f"Give your AI the phone: from {tilde(Path(ai_phone.__file__).parents[2])}, it can run"]
+    out += ["", "Give your AI the phone: it can run these from any folder"]
     out += [f"  {command.ljust(width)}   {what}" for command, what in commands]
     return "\n".join(out)
 
@@ -1079,7 +1164,19 @@ def try_it(lines: dict[str, dict]) -> list[str]:
         out += [f"{command}   {what}"] if len(command) + 3 + len(what) <= WIDTH else [command, f"    {what}"]
     if out:
         return out
-    return ["  nothing to call yet: the number is still being set up"] if lines else ["  add a line first: uv run ai-phone setup"]
+    if any(ln.get("kind", "trunk") == "trunk" and ln.get("from_user") == "account"
+           and provider_of(ln).get("state", "ready") == "ready" for ln in lines.values()):
+        return ["  call the number routed to your SIP account; check that route with your provider"]
+    return ["  nothing to call yet: the number is still being set up"] if lines else ["  add a line first: ai-phone setup"]
+
+
+def line_address(ln: dict) -> str:
+    if ln.get("number") or ln.get("aor"):
+        return ln.get("number") or ln["aor"]
+    if ln.get("kind", "trunk") == "trunk" and ln.get("user"):
+        host = str(ln.get("registrar") or "").removeprefix("sip:").split(";", 1)[0]
+        return f"sip:{ln['user']}@{host}" if host else ln["user"]
+    return ""
 
 
 def provider_of(ln: dict) -> dict:
@@ -1090,6 +1187,8 @@ def provider_of(ln: dict) -> dict:
 def calls_out(ln: dict) -> str:
     """A verified caller id the agent uses instead of the line's own number. A sip line's caller id is its own
     address, which is no news to anyone."""
+    if ln.get("kind", "trunk") == "trunk" and ln.get("from_user") == "account" and not managed_caller_id(ln):
+        return " · caller ID set by your provider"
     caller = ln.get("caller_id")
     return f" · calls out as {caller}" if caller and caller not in (ln.get("number"), ln.get("aor")) else ""
 
@@ -1100,7 +1199,8 @@ def line_kind(ln: dict) -> str:
         return "SIP address"
     if not provider.get("name"):
         return "SIP trunk"
-    kind = f"{str(provider['name']).capitalize()} number"
+    carrier = CARRIER_INFO.get(provider["name"])
+    kind = f"{carrier.label if carrier else str(provider['name']).capitalize()} number"
     return kind if provider.get("state", "ready") == "ready" else f"{kind} · {provider['state']}"
 
 
